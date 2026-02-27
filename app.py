@@ -32,11 +32,18 @@ if st.button("一键生成"):
     # 读取入库资料
     df_in = pd.read_excel(inbound_file)
 
-    cpu = df_in.loc[df_in.iloc[:,0]=="CP型号"].iloc[0,1]
-    screen = df_in.loc[df_in.iloc[:,0]=="屏幕尺寸（英寸）"].iloc[0,1]
-    battery = df_in.loc[df_in.iloc[:,0]=="电池容量（mAH）"].iloc[0,1]
-    cam_main = df_in.loc[df_in.iloc[:,0]=="主摄像头物理像素（万像素）"].iloc[0,1]
-    cam_sub = df_in.loc[df_in.iloc[:,0]=="次摄像头物理像素（万像素）"].iloc[0,1]
+    def get_value(df, keyword):
+    df = df.astype(str)
+    match = df[df.apply(lambda row: row.astype(str).str.contains(keyword).any(), axis=1)]
+    if len(match) == 0:
+        return ""
+    return match.iloc[0,1]
+
+    cpu = get_value(df_in, "CP型号")
+    screen = get_value(df_in, "屏幕尺寸")
+    battery = get_value(df_in, "电池容量")
+    cam_main = get_value(df_in, "主摄")
+    cam_sub = get_value(df_in, "次摄")
 
     df_unpivot["CPU型号"] = cpu
     df_unpivot["屏幕"] = str(screen) + "英寸"
