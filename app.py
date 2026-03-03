@@ -4,7 +4,7 @@ import re
 import datetime as dt
 from copy import copy
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List
 
 import pandas as pd
 import streamlit as st
@@ -35,12 +35,9 @@ WRITE_FIELDS = {
 # 供应商名称固定写入 S 列（你要求“必须在 S 列”）
 SUPPLIER_COL_S = 19  # S = 19（1-indexed）
 
-# ======================
-# Streamlit UI
-# ======================
 st.set_page_config(page_title="OPPO 引入回填", layout="wide")
 st.title("OPPO 引入回填（上传2个文件 → 一键生成）")
-st.caption("✅ 自动识别谈判表/入库表（顺序随意）｜✅ 规格+价格+数量结合识别｜✅ 只写指定字段，其余保持模板原样")
+st.caption("✅ 自动识别谈判表/入库表（顺序随意）｜✅ 规格+价格+数量联动｜✅ 生成后删除多余模板行（彻底消除 #DIV/0 空行）")
 
 
 # ======================
@@ -70,11 +67,10 @@ def merged_top_left_value(ws, r: int, c: int):
 
 
 def read_cell(ws, r: int, c: int):
-    return merged_top_left_value(ws, r, c)
+    return merged_top_left_value(ws, r, c).value if hasattr(merged_top_left_value(ws, r, c), "value") else merged_top_left_value(ws, r, c)
 
 
 def normalize_model_name(x) -> str:
-    """用于 token 抽取前的清洗（不改变谈判表原始型号文本）"""
     s = norm_text(x).upper()
     s = s.replace("（", "(").replace("）", ")")
     for bad in ["全网通", "移动", "联通", "电信", "公开版", "定制", "TD-LTE", "LTE", "NR"]:
@@ -83,26 +79,13 @@ def normalize_model_name(x) -> str:
 
 
 def extract_model_token(s: str) -> str:
-    """
-    从字符串中提取型号主体 token，如：
-    - A6x（PLT140 6G+128G） => PLT140
-    - Watch X3（OWW261）     => OWW261
-    - 15T（PLZ110 16G+512G） => PLZ110
-    """
     s = normalize_model_name(s)
     m = re.search(r"[A-Z]{2,}\d+[A-Z0-9]*", s)
     return m.group(0) if m else s
 
 
-# ======================
-# 模板文件（内置仓库）
-# ======================
 def find_template_path() -> Path:
-    candidates = [
-        Path("template.xlsx"),
-        Path("template(1).xlsx"),
-        Path("assets/template.xlsx"),
-    ]
+    candidates = [Path("template.xlsx"), Path("template(1).xlsx"), Path("assets/template.xlsx")]
     for p in candidates:
         if p.exists():
             return p
@@ -113,22 +96,15 @@ def find_template_path() -> Path:
 # 自动识别文件类型（关键）
 # ======================
 def identify_excel_type(file_like) -> str:
-    """
-    返回:
-      - 'negotiation'  谈判记录表
-      - 'inbound'      入库资料信息表
-      - 'unknown'
-    """
     try:
         file_like.seek(0)
         wb = load_workbook(file_like, read_only=True, data_only=True)
         sheets = wb.sheetnames
 
-        # 1) 强规则：sheet 名匹配
         if SHEET_NEG_DEFAULT in sheets:
             return "negotiation"
 
-        # 2) 扫前 30 行：是否包含谈判关键字段
+        # 谈判表关键字段
         for s in sheets[:3]:
             ws = wb[s]
             found_quote = False
@@ -144,7 +120,7 @@ def identify_excel_type(file_like) -> str:
             if found_quote and found_model:
                 return "negotiation"
 
-        # 3) 扫前 80 行：是否像入库表结构化表头
+        # 入库表关键字段
         inbound_keys = ["CP型号", "电池容量", "屏幕尺寸", "主摄像头物理像素", "次摄像头物理像素"]
         for s in sheets[:3]:
             ws = wb[s]
@@ -176,7 +152,6 @@ def split_two_files(files) -> Tuple:
     f1, f2 = files[0], files[1]
     t1 = identify_excel_type(f1)
     t2 = identify_excel_type(f2)
-
     f1.seek(0); f2.seek(0)
 
     if t1 == "negotiation" and t2 == "inbound":
@@ -184,33 +159,20 @@ def split_two_files(files) -> Tuple:
     if t2 == "negotiation" and t1 == "inbound":
         return f2, f1
 
-    raise RuntimeError(
-        f"文件类型识别失败：文件1={t1}，文件2={t2}。\n"
-        "请确认：\n"
-        "1）谈判表包含 sheet=产品谈判记录表 或 字段“供应商报价（元/台）/型号”。\n"
-        "2）入库表包含 CP型号/电池容量/屏幕尺寸 等表头。"
-    )
+    raise RuntimeError(f"文件类型识别失败：文件1={t1}，文件2={t2}。请确认一个是谈判表，一个是入库表。")
 
 
 # ======================
-# 读取谈判表：主数据（型号/价格/零售价/品牌）
+# 谈判表：主数据（每一行=一个型号版本，决定价格）
 # ======================
-def read_negotiation_items(neg_file_like, sheet: str = SHEET_NEG_DEFAULT) -> pd.DataFrame:
+def read_negotiation_items(neg_file_like) -> pd.DataFrame:
     neg_file_like.seek(0)
-    df = pd.read_excel(neg_file_like, sheet_name=sheet, header=3)
-
-    # 取有效行：供应商报价非空
+    df = pd.read_excel(neg_file_like, sheet_name=SHEET_NEG_DEFAULT, header=3)
     df_items = df[df["供应商报价（元/台）"].notna()].copy()
-
-    # token 给规格用，但价格/数量必须用“本行”
     df_items["__token__"] = df_items["型号"].astype(str).map(extract_model_token)
-
     return df_items
 
 
-# ======================
-# 读取谈判表数量：K-P 列六家公司（按 每一行型号 + 每一列供应商）
-# ======================
 def build_qty_map_and_suppliers(neg_file_like) -> Tuple[Dict[Tuple[str, str], int], List[str]]:
     neg_file_like.seek(0)
     wb = load_workbook(neg_file_like, data_only=True)
@@ -228,13 +190,13 @@ def build_qty_map_and_suppliers(neg_file_like) -> Tuple[Dict[Tuple[str, str], in
         if header_row:
             break
     if not header_row or not model_col:
-        raise RuntimeError("谈判记录表中未找到表头“型号”，请确认表结构未变。")
+        raise RuntimeError("谈判记录表中未找到表头“型号”。")
 
     supplier_cols = list(range(11, 17))  # K..P
     suppliers_raw = [norm_text(ws.cell(header_row, c).value) for c in supplier_cols]
     suppliers = [s for s in suppliers_raw if s]
-    if len(suppliers) == 0:
-        raise RuntimeError("谈判记录表 K-P 列未识别到供应商名称（表头行）。")
+    if not suppliers:
+        raise RuntimeError("谈判记录表 K-P 列未识别到供应商名称。")
 
     qty_map: Dict[Tuple[str, str], int] = {}
     for r in range(header_row + 1, ws.max_row + 1):
@@ -283,7 +245,6 @@ def try_parse_inbound_as_table(inbound_file_like) -> Tuple[Dict[str, dict], List
         header_row = None
         header_values: Dict[str, int] = {}
 
-        # 找表头行：前80行内包含“型号”且至少2个关键列
         for r in range(1, min(81, ws.max_row + 1)):
             row_texts = {}
             for c in range(1, min(ws.max_column, 200) + 1):
@@ -318,39 +279,28 @@ def try_parse_inbound_as_table(inbound_file_like) -> Tuple[Dict[str, dict], List
 
         model_col = header_values["model"]
         for r in range(header_row + 1, ws.max_row + 1):
-            mval = read_cell(ws, r, model_col)
+            mval = ws.cell(r, model_col).value
             if mval is None or str(mval).strip() == "":
                 continue
 
             token = extract_model_token(str(mval))
-            if not token:
-                continue
-
             sp = {}
             for key in ["cpu", "cam_main", "cam_sub", "screen", "battery", "net"]:
                 c = header_values.get(key)
-                sp[key] = read_cell(ws, r, c) if c else None
+                sp[key] = ws.cell(r, c).value if c else None
 
-            non_empty = sum(
-                1 for k in ["cpu", "screen", "battery", "cam_main", "cam_sub"]
-                if sp.get(k) not in [None, ""]
-            )
-
-            # 至少2个字段有值才收录，避免误命中无关表
+            non_empty = sum(1 for k in ["cpu", "screen", "battery", "cam_main", "cam_sub"] if sp.get(k) not in [None, ""])
             if non_empty >= 2:
                 # 同 token 多次出现：保留字段更全的
-                if token not in specs_map:
+                old = specs_map.get(token)
+                if old is None:
                     specs_map[token] = sp
                 else:
-                    old = specs_map[token]
-                    old_non_empty = sum(
-                        1 for k in ["cpu", "screen", "battery", "cam_main", "cam_sub"]
-                        if old.get(k) not in [None, ""]
-                    )
-                    if non_empty > old_non_empty:
+                    old_non = sum(1 for k in ["cpu", "screen", "battery", "cam_main", "cam_sub"] if old.get(k) not in [None, ""])
+                    if non_empty > old_non:
                         specs_map[token] = sp
 
-                debug_rows.append({"mode": "table", "sheet": sheet, "token": token, "score": non_empty, **sp})
+                debug_rows.append({"sheet": sheet, "token": token, "score": non_empty, **sp})
 
     return specs_map, debug_rows
 
@@ -392,28 +342,26 @@ def format_common_fields(specs: dict):
 
 
 # ======================
-# 核心：写入模板（规格 + 价格 + 数量 联动）
+# 写入模板：联动填规格+价格+数量，并删除多余行（关键修复点）
 # ======================
-def fill_template(
-    template_stream: io.BytesIO,
-    df_items: pd.DataFrame,
-    specs_map: Dict[str, dict],
-    debug_rows: List[dict],
-    qty_map: Dict[Tuple[str, str], int],
-    suppliers: List[str],
-) -> bytes:
+def fill_template(template_stream: io.BytesIO,
+                  df_items: pd.DataFrame,
+                  specs_map: Dict[str, dict],
+                  debug_rows: List[dict],
+                  qty_map: Dict[Tuple[str, str], int],
+                  suppliers: List[str]) -> bytes:
     wb = load_workbook(template_stream)
     ws = wb[SHEET_OUT]
 
-    # 找表头行（包含 品牌/型号/CPU型号）
+    # 找表头行
     header_row = None
     for r in range(1, 80):
-        row_vals = [ws.cell(r, c).value for c in range(1, 150)]
-        if "品牌" in row_vals and "型号" in row_vals and "CPU型号" in row_vals:
+        vals = [ws.cell(r, c).value for c in range(1, 150)]
+        if "品牌" in vals and "型号" in vals and "CPU型号" in vals:
             header_row = r
             break
     if header_row is None:
-        raise RuntimeError("未找到模板表头行（包含“品牌/型号/CPU型号”）。请确认模板未变更。")
+        raise RuntimeError("未找到模板表头行（品牌/型号/CPU型号）。")
 
     header_to_col = {}
     for c in range(1, ws.max_column + 1):
@@ -431,7 +379,7 @@ def fill_template(
     per_item_rows = max(1, len(suppliers))
     total_needed_rows = len(df_items) * per_item_rows
 
-    # 模板已有可用行数（以型号列连续非空判断）
+    # 计算模板当前数据区已有行数（按型号列连续非空）
     last = start_row - 1
     for r in range(start_row, ws.max_row + 1):
         if ws.cell(r, model_col).value is None:
@@ -459,14 +407,11 @@ def fill_template(
                 tgt.comment = None
             ws.row_dimensions[tgt_r].height = ws.row_dimensions[example_row].height
 
-    # 多余行：不删，只清空“我们会写的字段 + S列供应商”，避免公式/格式被破坏
+    # ✅✅✅ 核心修复：多余行直接删除（彻底消除空行公式导致 #DIV/0）
+    # 只删除“数据区”多出来的行，不动表头以上
+    # 注意：先确保 existing >= total_needed_rows
     if existing > total_needed_rows:
-        for r in range(start_row + total_needed_rows, start_row + existing):
-            safe_set(ws.cell(r, SUPPLIER_COL_S), None)
-            for h in WRITE_FIELDS:
-                c = header_to_col.get(h)
-                if c:
-                    safe_set(ws.cell(r, c), None)
+        ws.delete_rows(start_row + total_needed_rows, existing - total_needed_rows)
 
     def setv(r: int, header: str, value):
         if header not in WRITE_FIELDS:
@@ -475,60 +420,54 @@ def fill_template(
         if c:
             safe_set(ws.cell(r, c), value)
 
-    # === 以“谈判表每一行”为主键填充 ===
+    # 填充：以谈判表每一行为主（价格/型号版本），再展开6家供应商（数量）
     for i, (_, row) in enumerate(df_items.iterrows()):
         model_raw = row.get("型号")
         model_text = norm_text(model_raw)
         token = norm_text(row.get("__token__"))
 
-        # 规格：按 token 从入库表映射取
         specs = specs_map.get(token, {})
         cpu, camera, screen_txt, battery_txt, net_txt = format_common_fields(specs)
 
-        # 价格：严格用谈判表“当前行”
         price_buy = row.get("供应商报价（元/台）")
         price_retail = row.get("零售价")
 
         for j, supplier in enumerate(suppliers):
             r = start_row + i * per_item_rows + j
 
-            # S列：供应商名称
             safe_set(ws.cell(r, SUPPLIER_COL_S), supplier)
 
-            # 基本字段
             setv(r, "品牌", row.get("品牌"))
             setv(r, "型号", model_raw)
             setv(r, "品类", "手机")
 
-            # 规格（识别到才填，避免串型号）
             if cpu: setv(r, "CPU型号", cpu)
             if net_txt: setv(r, "网络制式", net_txt)
             if camera: setv(r, "摄像头", camera)
             if screen_txt: setv(r, "屏幕", screen_txt)
             if battery_txt: setv(r, "电池", battery_txt)
 
-            # 价格（本行）
+            # ✅ 价格：严格使用谈判表“这一行”的价格（与摄像头无关）
             if pd.notna(price_buy):
                 setv(r, "预计采购票面价（元）", float(price_buy))
             if pd.notna(price_retail):
                 setv(r, "预计零售价（元）", float(price_retail))
 
-            # 数量：谈判表“这一型号行” + “这一供应商列” => 合同预计数量
+            # ✅ 数量：谈判表 K-P（按型号行 + 供应商列）
             qty = qty_map.get((model_text, supplier))
             setv(r, "合同预计数量（台）", qty if qty is not None else None)
 
-    # debug sheet：便于你核对入库识别
+    # debug sheet
     try:
         if "debug_入库识别" in wb.sheetnames:
-            ws_dbg = wb["debug_入库识别"]
-            wb.remove(ws_dbg)
+            wb.remove(wb["debug_入库识别"])
         ws_dbg = wb.create_sheet("debug_入库识别")
-        ws_dbg.append(["mode", "sheet", "token", "score", "cpu", "cam_main", "cam_sub", "screen", "battery", "net"])
+        ws_dbg.append(["sheet", "token", "score", "cpu", "cam_main", "cam_sub", "screen", "battery", "net"])
         for d in debug_rows:
             ws_dbg.append([
-                d.get("mode"), d.get("sheet"), d.get("token"), d.get("score"),
+                d.get("sheet"), d.get("token"), d.get("score"),
                 d.get("cpu"), d.get("cam_main"), d.get("cam_sub"),
-                d.get("screen"), d.get("battery"), d.get("net")
+                d.get("screen"), d.get("battery"), d.get("net"),
             ])
     except Exception:
         pass
@@ -539,7 +478,7 @@ def fill_template(
 
 
 # ======================
-# 页面：上传两个文件（顺序随意）
+# UI：上传两个文件（顺序随意）
 # ======================
 uploaded_files = st.file_uploader(
     "上传 2 个 Excel（谈判记录表 + 入库资料信息表），顺序随意",
@@ -555,31 +494,20 @@ if run_btn:
             st.warning("请一次上传 2 个文件（谈判记录表 + 入库资料信息表）")
             st.stop()
 
-        # 自动拆分
         neg_file, inbound_file = split_two_files(uploaded_files)
         st.info(f"识别结果：谈判表 = {neg_file.name} ｜ 入库表 = {inbound_file.name}")
 
-        # 读取谈判表：每一行决定价格与型号变体
-        neg_file.seek(0)
         df_items = read_negotiation_items(neg_file)
-
-        # 读取数量：K-P 六供应商
-        neg_file.seek(0)
         qty_map, suppliers = build_qty_map_and_suppliers(neg_file)
 
-        # 读取入库规格：按 token 映射
-        inbound_file.seek(0)
         specs_map, debug_rows = try_parse_inbound_as_table(inbound_file)
         if not specs_map:
             st.error("入库资料表未识别到结构化规格表头（型号/CP型号/电池容量/屏幕尺寸等）。")
             st.stop()
 
-        # 模板（仓库内置）
         tpl_path = find_template_path()
-        template_bytes = tpl_path.read_bytes()
-        tpl_stream = io.BytesIO(template_bytes)
+        tpl_stream = io.BytesIO(tpl_path.read_bytes())
 
-        # 生成
         out_bytes = fill_template(tpl_stream, df_items, specs_map, debug_rows, qty_map, suppliers)
 
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -593,10 +521,10 @@ if run_btn:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        with st.expander("识别概览（核对用）"):
-            st.write("谈判表有效行数（即输出型号版本数）：", len(df_items))
-            st.write("识别到的供应商数（K-P）：", len(suppliers))
-            st.write("入库表识别到的型号 token 数：", len(specs_map))
+        with st.expander("核对信息（可选）"):
+            st.write("谈判表有效行数（输出型号版本数）：", len(df_items))
+            st.write("识别到供应商数（K-P）：", len(suppliers))
+            st.write("入库表识别到 token 数：", len(specs_map))
             st.write("示例 token：", sorted(list(specs_map.keys()))[:30])
 
     except Exception as e:
