@@ -401,8 +401,8 @@ def fill_template(
 neg_file = st.file_uploader("① 上传【谈判记录表】(xlsx)", type=["xlsx"], key="neg")
 inb_file = st.file_uploader("② 上传【入库资料信息表】(xlsx)", type=["xlsx"], key="inb")
 
-# 方案：模板优先使用仓库内置 assets/template.xlsx；如果没有，再让用户上传
-tpl_path = Path("assets/template.xlsx")
+
+tpl_path = Path("template.xlsx")
 tpl_file = None
 if tpl_path.exists():
     st.success("✅ 已检测到仓库内置模板：assets/template.xlsx（同事无需上传模板）")
