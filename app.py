@@ -36,6 +36,8 @@ WRITE_FIELDS = {
 # 供应商名称固定写入 S 列（你要求“必须在 S 列”）
 SUPPLIER_COL_S = 19  # S列（1-indexed）
 
+# Q列：相同型号合并
+MERGE_COL_Q = 17  # Q列（1-indexed）
 
 st.set_page_config(page_title="OPPO 引入回填", layout="wide")
 st.title("OPPO 引入回填（上传2个文件 → 一键生成）")
@@ -141,22 +143,16 @@ def split_two_files(files) -> Tuple:
 
 
 # ======================
-# 谈判表：用 openpyxl 读取，绑定“行号” → 价格 + 数量（彻底避免匹配不上）
+# 谈判表：openpyxl读取 + 行号绑定价格&数量
 # ======================
 def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str], Dict[Tuple[int, str], int]]:
-    """
-    返回：
-      df_items：每一行一个型号版本（含 __row__ 行号、__token__）
-      suppliers：K-P 表头的6家公司
-      qty_by_row_supplier：key=(谈判表行号, 供应商名) -> 数量
-    """
     neg_file_like.seek(0)
     wb = load_workbook(neg_file_like, data_only=True)
     if SHEET_NEG_DEFAULT not in wb.sheetnames:
         raise RuntimeError("谈判表缺少 sheet：产品谈判记录表")
     ws = wb[SHEET_NEG_DEFAULT]
 
-    # 找表头行（包含“型号”“供应商报价（元/台）”）
+    # 找表头行（型号 + 供应商报价）
     header_row = None
     col_map = {}
     for r in range(1, 60):
@@ -173,14 +169,13 @@ def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str],
     if not header_row:
         raise RuntimeError("谈判表找不到表头行（型号/供应商报价（元/台））。")
 
-    # 供应商表头 K-P
+    # 供应商表头K-P
     supplier_cols = list(range(11, 17))  # K..P
     suppliers = [norm_text(ws.cell(header_row, c).value) for c in supplier_cols]
     suppliers = [s for s in suppliers if s]
     if not suppliers:
         raise RuntimeError("谈判表 K-P 表头没有识别到供应商名称。")
 
-    # 必要列
     c_brand = col_map.get("品牌")
     c_model = col_map.get("型号")
     c_buy = col_map.get("供应商报价（元/台）")
@@ -199,7 +194,7 @@ def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str],
         if model is None or norm_text(model) == "":
             continue
         if buy is None or str(buy).strip() == "":
-            continue  # 报价为空的不算有效行
+            continue
 
         brand = ws.cell(r, c_brand).value if c_brand else None
         retail = ws.cell(r, c_retail).value if c_retail else None
@@ -209,11 +204,10 @@ def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str],
             "型号": model,
             "供应商报价（元/台）": buy,
             "零售价": retail,
-            "__row__": r,  # ✅ 行号
+            "__row__": r,
             "__token__": extract_model_token(str(model)),
         })
 
-        # ✅ 数量：同一行 K-P 直接取
         for idx, c in enumerate(supplier_cols):
             if idx >= len(suppliers):
                 break
@@ -354,7 +348,7 @@ def format_common_fields(specs: dict):
 
 
 # ======================
-# 写入模板（含：插入行复制公式/固定值 + 公式平移）
+# 写入模板（含：插入行复制公式/固定值 + 公式平移 + Q列按型号合并）
 # ======================
 def fill_template(template_stream: io.BytesIO,
                   df_items: pd.DataFrame,
@@ -400,16 +394,16 @@ def fill_template(template_stream: io.BytesIO,
         end = r
     existing = max(1, end - start_row + 1)
 
-    # ===== 不够行：插行 + 复制样式 + 复制非写入列公式/固定值（并平移公式）=====
+    # 不够行：插入行 + 复制样式 + 复制非写入列公式/固定值（并平移公式）
     if existing < total_needed_rows:
         ws.insert_rows(start_row + existing, amount=total_needed_rows - existing)
 
         # 我们写入的列号集合：这些列不复制公式，后面会写值
         write_cols = set()
         for h in WRITE_FIELDS:
-            c = header_to_col.get(h)
-            if c:
-                write_cols.add(c)
+            cc = header_to_col.get(h)
+            if cc:
+                write_cols.add(cc)
         write_cols.add(SUPPLIER_COL_S)
 
         for i in range(existing, total_needed_rows):
@@ -434,7 +428,6 @@ def fill_template(template_stream: io.BytesIO,
                 if c not in write_cols:
                     v = src.value
                     if isinstance(v, str) and v.startswith("="):
-                        # 关键：公式平移
                         try:
                             tgt.value = Translator(v, origin=src.coordinate).translate_formula(tgt.coordinate)
                         except Exception:
@@ -444,68 +437,18 @@ def fill_template(template_stream: io.BytesIO,
 
             ws.row_dimensions[tgt_r].height = ws.row_dimensions[example_row].height
 
-    # 多余行：删除（避免尾部残留公式/空行）
+    # 多余行：删除
     if existing > total_needed_rows:
         ws.delete_rows(start_row + total_needed_rows, existing - total_needed_rows)
 
     def setv(r: int, header: str, value):
         if header not in WRITE_FIELDS:
             return
-        c = header_to_col.get(header)
-        if c:
-            safe_set(ws.cell(r, c), "" if value is None else value)
-    def merge_q_by_model():
-        q_col = 17  # Q列
-        first = start_row
-        last = start_row + total_needed_rows - 1
-        if last < first:
-            return
+        cc = header_to_col.get(header)
+        if cc:
+            safe_set(ws.cell(r, cc), "" if value is None else value)
 
-        # 先清掉数据区内Q列已有的合并（避免重复合并报错）
-        to_remove = []
-        for rng in list(ws.merged_cells.ranges):
-            if rng.min_col == q_col and rng.max_col == q_col:
-                # 与数据区有交集才移除
-                if not (rng.max_row < first or rng.min_row > last):
-                    to_remove.append(rng)
-        for rng in to_remove:
-            try:
-                ws.unmerge_cells(str(rng))
-            except Exception:
-                pass
-
-        # 逐段合并：相邻行型号相同则合并Q列
-        def get_model(r: int) -> str:
-            v = ws.cell(r, model_col).value
-            return norm_text(v)
-
-        r = first
-        while r <= last:
-            m = get_model(r)
-            if not m:
-                r += 1
-                continue
-            r2 = r
-            while r2 + 1 <= last and get_model(r2 + 1) == m:
-                r2 += 1
-
-            # r..r2 是同型号连续区间
-            if r2 > r:
-                # 合并前，把首行的Q值保留下来（如果模板里有/或你后续会写）
-                top_val = ws.cell(r, q_col).value
-                ws.merge_cells(start_row=r, start_column=q_col, end_row=r2, end_column=q_col)
-                ws.cell(r, q_col).value = top_val
-
-                # 可选：让合并后的单元格垂直居中（通常更好看）
-                try:
-                    ws.cell(r, q_col).alignment = copy(ws.cell(r, q_col).alignment).copy(vertical="center")
-                except Exception:
-                    pass
-
-            r = r2 + 1
-                merge_q_by_model()
-
-    # ===== 填充：谈判表每行 × 6公司 =====
+    # ===== 填充：谈判表每行 × 供应商 =====
     for i, row in df_items.iterrows():
         model_raw = row.get("型号")
         brand = row.get("品牌")
@@ -532,15 +475,61 @@ def fill_template(template_stream: io.BytesIO,
             setv(r, "屏幕", screen_txt)
             setv(r, "电池", battery_txt)
 
-            # 价格：谈判表当前行
             setv(r, "预计采购票面价（元）", float(buy) if pd.notna(buy) else "")
             setv(r, "预计零售价（元）", float(retail) if pd.notna(retail) else "")
 
-            # 数量：谈判表同一行 K-P
             qty = qty_by_row_supplier.get((row_id, supplier))
             setv(r, "合同预计数量（台）", qty if qty is not None else "")
 
-    # debug sheet：辅助排查
+    # ===== Q列按相同“型号”合并（只合并数据区）=====
+    def merge_q_by_model():
+        q_col = MERGE_COL_Q
+        first = start_row
+        last = start_row + total_needed_rows - 1
+        if last < first:
+            return
+
+        # 先清掉数据区内Q列已有合并（避免重复合并报错）
+        to_remove = []
+        for rng in list(ws.merged_cells.ranges):
+            if rng.min_col == q_col and rng.max_col == q_col:
+                if not (rng.max_row < first or rng.min_row > last):
+                    to_remove.append(rng)
+        for rng in to_remove:
+            try:
+                ws.unmerge_cells(str(rng))
+            except Exception:
+                pass
+
+        def get_model(r: int) -> str:
+            return norm_text(ws.cell(r, model_col).value)
+
+        r = first
+        while r <= last:
+            m = get_model(r)
+            if not m:
+                r += 1
+                continue
+            r2 = r
+            while r2 + 1 <= last and get_model(r2 + 1) == m:
+                r2 += 1
+
+            if r2 > r:
+                top_val = ws.cell(r, q_col).value
+                ws.merge_cells(start_row=r, start_column=q_col, end_row=r2, end_column=q_col)
+                ws.cell(r, q_col).value = top_val
+
+                # 垂直居中（更好看）
+                try:
+                    ws.cell(r, q_col).alignment = copy(ws.cell(r, q_col).alignment).copy(vertical="center")
+                except Exception:
+                    pass
+
+            r = r2 + 1
+
+    merge_q_by_model()
+
+    # debug sheet（可选）
     try:
         if "debug_入库识别" in wb.sheetnames:
             wb.remove(wb["debug_入库识别"])
