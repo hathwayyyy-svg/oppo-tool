@@ -39,7 +39,7 @@ SUPPLIER_COL_S = 19  # S列（1-indexed）
 
 st.set_page_config(page_title="OPPO 引入回填", layout="wide")
 st.title("OPPO 引入回填（上传2个文件 → 一键生成）")
-st.caption("✅ 自动识别谈判表/入库表（顺序随意）｜✅ 数量按谈判表“同一行”硬绑定｜✅ 插入行自动复制模板公式（修复27行后空白）")
+st.caption("✅ 自动识别谈判表/入库表（顺序随意）")
 
 
 # ======================
@@ -454,6 +454,56 @@ def fill_template(template_stream: io.BytesIO,
         c = header_to_col.get(header)
         if c:
             safe_set(ws.cell(r, c), "" if value is None else value)
+    def merge_q_by_model():
+        q_col = 17  # Q列
+        first = start_row
+        last = start_row + total_needed_rows - 1
+        if last < first:
+            return
+
+        # 先清掉数据区内Q列已有的合并（避免重复合并报错）
+        to_remove = []
+        for rng in list(ws.merged_cells.ranges):
+            if rng.min_col == q_col and rng.max_col == q_col:
+                # 与数据区有交集才移除
+                if not (rng.max_row < first or rng.min_row > last):
+                    to_remove.append(rng)
+        for rng in to_remove:
+            try:
+                ws.unmerge_cells(str(rng))
+            except Exception:
+                pass
+
+        # 逐段合并：相邻行型号相同则合并Q列
+        def get_model(r: int) -> str:
+            v = ws.cell(r, model_col).value
+            return norm_text(v)
+
+        r = first
+        while r <= last:
+            m = get_model(r)
+            if not m:
+                r += 1
+                continue
+            r2 = r
+            while r2 + 1 <= last and get_model(r2 + 1) == m:
+                r2 += 1
+
+            # r..r2 是同型号连续区间
+            if r2 > r:
+                # 合并前，把首行的Q值保留下来（如果模板里有/或你后续会写）
+                top_val = ws.cell(r, q_col).value
+                ws.merge_cells(start_row=r, start_column=q_col, end_row=r2, end_column=q_col)
+                ws.cell(r, q_col).value = top_val
+
+                # 可选：让合并后的单元格垂直居中（通常更好看）
+                try:
+                    ws.cell(r, q_col).alignment = copy(ws.cell(r, q_col).alignment).copy(vertical="center")
+                except Exception:
+                    pass
+
+            r = r2 + 1
+                merge_q_by_model()
 
     # ===== 填充：谈判表每行 × 6公司 =====
     for i, row in df_items.iterrows():
