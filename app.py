@@ -33,7 +33,7 @@ WRITE_FIELDS = {
     "合同预计数量（台）",
 }
 
-# 供应商名称固定写入 S 列（你要求“必须在 S 列”）
+# 供应商名称固定写入 S 列
 SUPPLIER_COL_S = 19  # S列（1-indexed）
 
 # Q列：相同型号合并
@@ -41,7 +41,9 @@ MERGE_COL_Q = 17  # Q列（1-indexed）
 
 st.set_page_config(page_title="OPPO 引入回填", layout="wide")
 st.title("OPPO 引入回填（上传2个文件 → 一键生成）")
-st.caption("✅ 自动识别谈判表/入库表（顺序随意）")
+st.caption(
+    "✅ 自动识别谈判表/入库表（顺序随意）"
+)
 
 
 # ======================
@@ -71,6 +73,18 @@ def extract_model_token(s: str) -> str:
     s = normalize_model_name(s)
     m = re.search(r"[A-Z]{2,}\d+[A-Z0-9]*", s)
     return m.group(0) if m else s
+
+
+def clean_model_for_output(x) -> str:
+    """
+    写入模板时用：
+    - 去掉“分销公开版”
+    - 清理多余空格
+    """
+    s = norm_text(x)
+    s = s.replace("分销公开版", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def find_template_path() -> Path:
@@ -398,7 +412,7 @@ def fill_template(template_stream: io.BytesIO,
     if existing < total_needed_rows:
         ws.insert_rows(start_row + existing, amount=total_needed_rows - existing)
 
-        # 我们写入的列号集合：这些列不复制公式，后面会写值
+        # 写入列集合：这些列后续代码会写，不复制公式
         write_cols = set()
         for h in WRITE_FIELDS:
             cc = header_to_col.get(h)
@@ -451,6 +465,7 @@ def fill_template(template_stream: io.BytesIO,
     # ===== 填充：谈判表每行 × 供应商 =====
     for i, row in df_items.iterrows():
         model_raw = row.get("型号")
+        model_output = clean_model_for_output(model_raw)  # ✅ 新增：写模板前去掉“分销公开版”
         brand = row.get("品牌")
         buy = row.get("供应商报价（元/台）")
         retail = row.get("零售价")
@@ -461,12 +476,12 @@ def fill_template(template_stream: io.BytesIO,
         cpu, camera, screen_txt, battery_txt, net_txt = format_common_fields(specs)
 
         for j, supplier in enumerate(suppliers):
-            r = start_row + i * per_item_rows + j
+            r = start_row + i * len(suppliers) + j
 
             safe_set(ws.cell(r, SUPPLIER_COL_S), supplier)
 
             setv(r, "品牌", brand)
-            setv(r, "型号", model_raw)
+            setv(r, "型号", model_output)   # ✅ 写入的是清洗后的型号
             setv(r, "品类", "手机")
 
             setv(r, "CPU型号", cpu)
@@ -489,7 +504,7 @@ def fill_template(template_stream: io.BytesIO,
         if last < first:
             return
 
-        # 先清掉数据区内Q列已有合并（避免重复合并报错）
+        # 清掉数据区内Q列已有合并
         to_remove = []
         for rng in list(ws.merged_cells.ranges):
             if rng.min_col == q_col and rng.max_col == q_col:
@@ -510,6 +525,7 @@ def fill_template(template_stream: io.BytesIO,
             if not m:
                 r += 1
                 continue
+
             r2 = r
             while r2 + 1 <= last and get_model(r2 + 1) == m:
                 r2 += 1
@@ -519,7 +535,7 @@ def fill_template(template_stream: io.BytesIO,
                 ws.merge_cells(start_row=r, start_column=q_col, end_row=r2, end_column=q_col)
                 ws.cell(r, q_col).value = top_val
 
-                # 垂直居中（更好看）
+                # 垂直居中
                 try:
                     ws.cell(r, q_col).alignment = copy(ws.cell(r, q_col).alignment).copy(vertical="center")
                 except Exception:
