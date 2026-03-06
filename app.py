@@ -11,6 +11,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.formula.translate import Translator
+from docx import Document
 
 # ======================
 # 固定配置
@@ -39,8 +40,12 @@ SUPPLIER_COL_S = 19  # S列（1-indexed）
 # Q列：相同型号合并
 MERGE_COL_Q = 17  # Q列（1-indexed）
 
+# Word 模板里需要替换的原始文本（按你现在文档原文）
+DOCX_PRODUCTS_OLD_TEXT = "OPPO A6x 系列、N6 卫星版、Watch X3、一加 15T"
+DOCX_PRICE_OLD_TEXT = "1999-13999 元"
+
 st.set_page_config(page_title="OPPO 引入回填", layout="wide")
-st.title("OPPO 引入回填（上传2个文件 → 一键生成）")
+st.title("OPPO 引入回填（上传2个文件 → 一键生成 Excel + Word）")
 st.caption(
     "✅ 自动识别谈判表/入库表（顺序随意）"
 )
@@ -84,14 +89,28 @@ def clean_model_for_output(x) -> str:
     s = norm_text(x)
     s = s.replace("分销公开版", "")
     s = re.sub(r"\s+", " ", s).strip()
+    # 去掉 “A6x （PLT140...）” 这种多余空格
+    s = s.replace(" （", "（")
     return s
 
 
-def find_template_path() -> Path:
+def find_excel_template_path() -> Path:
     for p in [Path("template.xlsx"), Path("template(1).xlsx"), Path("assets/template.xlsx")]:
         if p.exists():
             return p
-    raise RuntimeError("仓库内未找到模板文件：template.xlsx / template(1).xlsx / assets/template.xlsx")
+    raise RuntimeError("仓库内未找到 Excel 模板：template.xlsx / template(1).xlsx / assets/template.xlsx")
+
+
+def find_docx_template_path() -> Path:
+    candidates = [
+        Path("关于2026年3月第二批产品引入的请示.docx"),
+        Path("请示模板.docx"),
+        Path("assets/关于2026年3月第二批产品引入的请示.docx"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise RuntimeError("仓库内未找到 Word 模板：关于2026年3月第二批产品引入的请示.docx")
 
 
 # ======================
@@ -183,7 +202,6 @@ def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str],
     if not header_row:
         raise RuntimeError("谈判表找不到表头行（型号/供应商报价（元/台））。")
 
-    # 供应商表头K-P
     supplier_cols = list(range(11, 17))  # K..P
     suppliers = [norm_text(ws.cell(header_row, c).value) for c in supplier_cols]
     suppliers = [s for s in suppliers if s]
@@ -362,7 +380,127 @@ def format_common_fields(specs: dict):
 
 
 # ======================
-# 写入模板（含：插入行复制公式/固定值 + 公式平移 + Q列按型号合并）
+# Word：请示文档填充
+# ======================
+def derive_docx_product_names(df_items: pd.DataFrame) -> str:
+    """
+    根据谈判表汇总出产品名称列表，用于填充 Word 第一处高亮
+    目标风格类似：
+    OPPO A6x 系列、N6 卫星版、Watch X3、一加 15T
+    """
+    names = []
+    seen = set()
+
+    for _, row in df_items.iterrows():
+        brand = norm_text(row.get("品牌"))
+        model_raw = clean_model_for_output(row.get("型号"))
+
+        # 拿括号前主名称
+        main_name = model_raw.split("（")[0].split("(")[0].strip()
+        main_name = re.sub(r"\s+", " ", main_name)
+
+        display = main_name
+
+        # 品牌修饰
+        if brand.upper() == "OPPO":
+            # A系列补“OPPO ”前缀；Watch 保持 Watch X3；Find/N类似直接保留
+            if main_name.upper().startswith("A"):
+                display = f"OPPO {main_name} 系列"
+            elif main_name.upper().startswith("WATCH"):
+                display = main_name
+            else:
+                display = main_name
+        elif "一加" in brand or brand.upper() in ["ONEPLUS", "1+", "一加"]:
+            if not main_name.startswith("一加"):
+                display = f"一加 {main_name}"
+            else:
+                display = main_name
+        else:
+            if brand and not main_name.startswith(brand):
+                display = f"{brand} {main_name}"
+
+        display = re.sub(r"\s+", " ", display).strip()
+
+        if display not in seen:
+            seen.add(display)
+            names.append(display)
+
+    return "、".join(names)
+
+
+def derive_docx_price_range(df_items: pd.DataFrame) -> str:
+    """
+    根据谈判记录表零售价生成范围：
+    - 1999-6099元
+    - 如果最小最大一样：1999元
+    """
+    prices = pd.to_numeric(df_items["零售价"], errors="coerce").dropna()
+    if prices.empty:
+        return ""
+    pmin = int(prices.min())
+    pmax = int(prices.max())
+    if pmin == pmax:
+        return f"{pmin}元"
+    return f"{pmin}-{pmax}元"
+
+
+def replace_text_in_paragraph(paragraph, old_text: str, new_text: str) -> bool:
+    """
+    尽量在 run 级替换，保留大部分格式。
+    如果 old_text 跨多个 run，则退化为整段替换（可能损失该段部分格式）。
+    """
+    # 1) 先尝试单 run 直接替换
+    for run in paragraph.runs:
+        if old_text in run.text:
+            run.text = run.text.replace(old_text, new_text)
+            return True
+
+    # 2) 跨 run：整段替换
+    full_text = "".join(run.text for run in paragraph.runs)
+    if old_text in full_text:
+        new_full_text = full_text.replace(old_text, new_text)
+        if paragraph.runs:
+            paragraph.runs[0].text = new_full_text
+            for run in paragraph.runs[1:]:
+                run.text = ""
+        else:
+            paragraph.add_run(new_full_text)
+        return True
+
+    return False
+
+
+def fill_docx_template(docx_template_path: Path, df_items: pd.DataFrame) -> bytes:
+    """
+    填充两处高亮内容：
+    1) 所有产品名称汇总
+    2) 零售价范围
+    """
+    product_names = derive_docx_product_names(df_items)
+    price_range = derive_docx_price_range(df_items)
+
+    doc = Document(str(docx_template_path))
+
+    # 替换正文段落
+    for p in doc.paragraphs:
+        replace_text_in_paragraph(p, DOCX_PRODUCTS_OLD_TEXT, product_names)
+        replace_text_in_paragraph(p, DOCX_PRICE_OLD_TEXT, price_range)
+
+    # 替换表格内（如未来模板挪到表格里也能适配）
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    replace_text_in_paragraph(p, DOCX_PRODUCTS_OLD_TEXT, product_names)
+                    replace_text_in_paragraph(p, DOCX_PRICE_OLD_TEXT, price_range)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# ======================
+# Excel：写入模板（含：插入行复制公式/固定值 + 公式平移 + Q列按型号合并）
 # ======================
 def fill_template(template_stream: io.BytesIO,
                   df_items: pd.DataFrame,
@@ -465,7 +603,7 @@ def fill_template(template_stream: io.BytesIO,
     # ===== 填充：谈判表每行 × 供应商 =====
     for i, row in df_items.iterrows():
         model_raw = row.get("型号")
-        model_output = clean_model_for_output(model_raw)  # ✅ 新增：写模板前去掉“分销公开版”
+        model_output = clean_model_for_output(model_raw)
         brand = row.get("品牌")
         buy = row.get("供应商报价（元/台）")
         retail = row.get("零售价")
@@ -481,7 +619,7 @@ def fill_template(template_stream: io.BytesIO,
             safe_set(ws.cell(r, SUPPLIER_COL_S), supplier)
 
             setv(r, "品牌", brand)
-            setv(r, "型号", model_output)   # ✅ 写入的是清洗后的型号
+            setv(r, "型号", model_output)
             setv(r, "品类", "手机")
 
             setv(r, "CPU型号", cpu)
@@ -535,7 +673,6 @@ def fill_template(template_stream: io.BytesIO,
                 ws.merge_cells(start_row=r, start_column=q_col, end_row=r2, end_column=q_col)
                 ws.cell(r, q_col).value = top_val
 
-                # 垂直居中
                 try:
                     ws.cell(r, q_col).alignment = copy(ws.cell(r, q_col).alignment).copy(vertical="center")
                 except Exception:
@@ -574,7 +711,7 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-run_btn = st.button("🚀 一键生成", type="primary")
+run_btn = st.button("🚀 一键生成 Excel + Word", type="primary")
 
 if run_btn:
     try:
@@ -594,28 +731,45 @@ if run_btn:
             st.error("入库资料表没有识别到结构化规格表头（型号/CP型号/电池容量/屏幕尺寸等）。")
             st.stop()
 
-        # 模板（仓库内置）
-        tpl_path = find_template_path()
-        tpl_stream = io.BytesIO(tpl_path.read_bytes())
+        # Excel 模板
+        excel_tpl_path = find_excel_template_path()
+        excel_tpl_stream = io.BytesIO(excel_tpl_path.read_bytes())
 
-        # 生成
-        out_bytes = fill_template(tpl_stream, df_items, suppliers, qty_by_row_supplier, specs_map, debug_rows)
+        # 生成 Excel
+        excel_bytes = fill_template(excel_tpl_stream, df_items, suppliers, qty_by_row_supplier, specs_map, debug_rows)
+
+        # 生成 Word
+        docx_tpl_path = find_docx_template_path()
+        docx_bytes = fill_docx_template(docx_tpl_path, df_items)
 
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"【生成】产品引入详细信息及风险评估_{ts}.xlsx"
+        excel_filename = f"【生成】产品引入详细信息及风险评估_{ts}.xlsx"
+        docx_filename = f"【生成】关于产品引入的请示_{ts}.docx"
 
         st.success("✅ 生成成功！请下载：")
-        st.download_button(
-            "⬇️ 下载结果文件",
-            data=out_bytes,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "⬇️ 下载 Excel 结果文件",
+                data=excel_bytes,
+                file_name=excel_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with c2:
+            st.download_button(
+                "⬇️ 下载 Word 请示文件",
+                data=docx_bytes,
+                file_name=docx_filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
         with st.expander("核对信息（可选）"):
             st.write("谈判表有效行数（输出型号版本数）：", len(df_items))
             st.write("供应商数量（K-P）：", len(suppliers))
             st.write("入库表识别到 token 数：", len(specs_map))
+            st.write("Word 产品名称填充：", derive_docx_product_names(df_items))
+            st.write("Word 价格范围填充：", derive_docx_price_range(df_items))
 
     except Exception as e:
         st.error("运行失败（请看详细报错）")
