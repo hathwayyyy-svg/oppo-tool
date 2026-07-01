@@ -189,17 +189,41 @@ def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str],
     if not (c_model and c_buy):
         raise RuntimeError("谈判表缺少必要列：型号 / 供应商报价（元/台）")
 
-    # ✅ 动态识别供应商列：从 K 列开始，连续读取到空列为止
-    supplier_cols = []
-    suppliers = []
-    c = 11
-    while c <= ws.max_column:
-        name = norm_text(ws.cell(header_row, c).value)
-        if name == "":
-            break
+  
+    # ✅ 动态识别供应商列：从 K 列开始，只识别公司名称列
+supplier_cols = []
+suppliers = []
+
+STOP_WORDS = [
+    "合计", "总计", "小计", "备注", "说明",
+    "零售价", "供应商报价", "采购价", "价格",
+    "数量合计", "金额", "毛利", "返利"
+]
+
+c = 11  # K列开始
+
+while c <= ws.max_column:
+    name = norm_text(ws.cell(header_row, c).value)
+
+    if name == "":
+        break
+
+    # 遇到明显不是供应商的表头，停止
+    if any(word in name for word in STOP_WORDS):
+        break
+
+    # 只把公司名称识别为供应商
+    if "公司" in name or "有限公司" in name:
         supplier_cols.append(c)
         suppliers.append(name)
         c += 1
+        continue
+
+    # 其他内容一律停止，避免把后面的字段识别进去
+    break
+
+if not suppliers:
+    raise RuntimeError("谈判表从 K 列开始未识别到供应商名称。")
 
     if not suppliers:
         raise RuntimeError("谈判表从 K 列开始未识别到供应商名称。")
