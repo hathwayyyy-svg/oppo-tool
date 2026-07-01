@@ -26,7 +26,7 @@ MERGE_COL_Q = 17
 
 st.set_page_config(page_title="OPPO 引入回填", layout="wide")
 st.title("OPPO 引入回填（上传2个文件 → 一键生成 Excel + Word）")
-st.caption("✅ 动态识别供应商数量｜✅ 价格数量按谈判表同一行绑定｜✅ Q列按相同3C合并｜✅ 自动生成请示Word")
+st.caption("✅ 动态识别供应商公司列｜✅ 不误识别后续字段｜✅ Q列按相同3C合并｜✅ 自动生成Word")
 
 
 def norm_text(x) -> str:
@@ -50,13 +50,7 @@ def normalize_model_name(x) -> str:
 
 
 def extract_model_token(s: str) -> str:
-    """
-    优先提取括号里的3C型号：
-    Reno15（PLW110 16G+256G） -> PLW110
-    A6x（PLT140 8G+256G） -> PLT140
-    """
     raw = norm_text(s).upper().replace("（", "(").replace("）", ")")
-
     bracket_matches = re.findall(r"\((.*?)\)", raw)
     for part in bracket_matches:
         m = re.search(r"[A-Z]{2,}\d+[A-Z0-9]*", part)
@@ -66,7 +60,6 @@ def extract_model_token(s: str) -> str:
     s2 = normalize_model_name(s)
     matches = re.findall(r"[A-Z]{2,}\d+[A-Z0-9]*", s2)
     if matches:
-        # 排除 RENO15 这种产品名误识别，优先 P/O 开头的3C
         for m in matches:
             if m.startswith(("P", "O")):
                 return m
@@ -138,6 +131,7 @@ def identify_excel_type(file_like) -> str:
                     return "inbound"
     except Exception:
         pass
+
     return "unknown"
 
 
@@ -189,44 +183,38 @@ def read_negotiation_with_rowid(neg_file_like) -> Tuple[pd.DataFrame, List[str],
     if not (c_model and c_buy):
         raise RuntimeError("谈判表缺少必要列：型号 / 供应商报价（元/台）")
 
-  
-    # ✅ 动态识别供应商列：从 K 列开始，只识别公司名称列
-supplier_cols = []
-suppliers = []
+    # ✅ 动态识别供应商列：从 K 列开始，只识别公司名称列，遇到非公司字段停止
+    supplier_cols = []
+    suppliers = []
 
-STOP_WORDS = [
-    "合计", "总计", "小计", "备注", "说明",
-    "零售价", "供应商报价", "采购价", "价格",
-    "数量合计", "金额", "毛利", "返利"
-]
+    STOP_WORDS = [
+        "合计", "总计", "小计", "备注", "说明",
+        "零售价", "供应商报价", "采购价", "价格",
+        "数量合计", "金额", "毛利", "返利",
+        "成本", "利润", "税率", "税额"
+    ]
 
-c = 11  # K列开始
+    c = 11  # K列开始
 
-while c <= ws.max_column:
-    name = norm_text(ws.cell(header_row, c).value)
+    while c <= ws.max_column:
+        name = norm_text(ws.cell(header_row, c).value)
 
-    if name == "":
+        if name == "":
+            break
+
+        if any(word in name for word in STOP_WORDS):
+            break
+
+        if "公司" in name or "有限公司" in name:
+            supplier_cols.append(c)
+            suppliers.append(name)
+            c += 1
+            continue
+
         break
-
-    # 遇到明显不是供应商的表头，停止
-    if any(word in name for word in STOP_WORDS):
-        break
-
-    # 只把公司名称识别为供应商
-    if "公司" in name or "有限公司" in name:
-        supplier_cols.append(c)
-        suppliers.append(name)
-        c += 1
-        continue
-
-    # 其他内容一律停止，避免把后面的字段识别进去
-    break
-
-if not suppliers:
-    raise RuntimeError("谈判表从 K 列开始未识别到供应商名称。")
 
     if not suppliers:
-        raise RuntimeError("谈判表从 K 列开始未识别到供应商名称。")
+        raise RuntimeError("谈判表从 K 列开始未识别到供应商公司名称。")
 
     rows = []
     qty_by_row_supplier: Dict[Tuple[int, str], int] = {}
@@ -496,12 +484,14 @@ def fill_docx_template(docx_template_path: Path, df_items: pd.DataFrame) -> byte
     return buf.getvalue()
 
 
-def fill_template(template_stream: io.BytesIO,
-                  df_items: pd.DataFrame,
-                  suppliers: List[str],
-                  qty_by_row_supplier: Dict[Tuple[int, str], int],
-                  specs_map: Dict[str, dict],
-                  debug_rows: List[dict]) -> bytes:
+def fill_template(
+    template_stream: io.BytesIO,
+    df_items: pd.DataFrame,
+    suppliers: List[str],
+    qty_by_row_supplier: Dict[Tuple[int, str], int],
+    specs_map: Dict[str, dict],
+    debug_rows: List[dict],
+) -> bytes:
     wb = load_workbook(template_stream)
     ws = wb[SHEET_OUT]
 
@@ -524,8 +514,7 @@ def fill_template(template_stream: io.BytesIO,
     example_row = start_row
     model_col = header_to_col["型号"]
 
-    per_item_rows = len(suppliers)
-    total_needed_rows = len(df_items) * per_item_rows
+    total_needed_rows = len(df_items) * len(suppliers)
 
     end = start_row - 1
     for r in range(start_row, ws.max_row + 1):
@@ -550,6 +539,7 @@ def fill_template(template_stream: io.BytesIO,
             for c in range(1, ws.max_column + 1):
                 src = ws.cell(example_row, c)
                 tgt = ws.cell(tgt_r, c)
+
                 if isinstance(tgt, MergedCell):
                     continue
 
@@ -659,9 +649,11 @@ def fill_template(template_stream: io.BytesIO,
         ws_dbg = wb.create_sheet("debug_入库识别")
         ws_dbg.append(["sheet", "token", "score", "cpu", "cam_main", "cam_sub", "screen", "battery", "net"])
         for d in debug_rows:
-            ws_dbg.append([d.get("sheet"), d.get("token"), d.get("score"),
-                           d.get("cpu"), d.get("cam_main"), d.get("cam_sub"),
-                           d.get("screen"), d.get("battery"), d.get("net")])
+            ws_dbg.append([
+                d.get("sheet"), d.get("token"), d.get("score"),
+                d.get("cpu"), d.get("cam_main"), d.get("cam_sub"),
+                d.get("screen"), d.get("battery"), d.get("net"),
+            ])
     except Exception:
         pass
 
@@ -722,6 +714,7 @@ if run_btn:
                 file_name=f"【生成】产品引入详细信息及风险评估_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
         with c2:
             if docx_bytes:
                 st.download_button(
